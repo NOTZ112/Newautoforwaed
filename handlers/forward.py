@@ -6,7 +6,6 @@ from telegram.error import Forbidden, BadRequest, RetryAfter, TimedOut
 from telegram.ext import ContextTypes
 
 import database as db
-from config import OWNER_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +15,14 @@ MAX_CONCURRENT_SENDS = 5
 
 def _passes_filter(message, filter_type: str) -> bool:
     is_media = bool(
-        message.photo or message.video or message.document or message.audio
-        or message.animation or message.voice or message.video_note or message.sticker
+        message.photo
+        or message.video
+        or message.document
+        or message.audio
+        or message.animation
+        or message.voice
+        or message.video_note
+        or message.sticker
     )
 
     if filter_type == "all":
@@ -40,7 +45,13 @@ def _hits_blacklist(message, blacklist) -> bool:
     return any(word in content for word in blacklist)
 
 
-async def _send_with_retry(bot, source_id, target_id, message, mode):
+async def _send_with_retry(
+    bot,
+    source_id,
+    target_id,
+    message,
+    mode,
+):
     attempt = 0
 
     while attempt < MAX_RETRIES:
@@ -69,8 +80,6 @@ async def _send_with_retry(bot, source_id, target_id, message, mode):
 
             await asyncio.sleep(e.retry_after + 1)
 
-            continue
-
         except TimedOut:
             attempt += 1
 
@@ -79,7 +88,7 @@ async def _send_with_retry(bot, source_id, target_id, message, mode):
             )
 
         except Forbidden as e:
-            # Bot kicked / blocked / access lost
+            # Target is unavailable / bot lost access.
             return False, ("target_unavailable", str(e))
 
         except BadRequest as e:
@@ -87,10 +96,14 @@ async def _send_with_retry(bot, source_id, target_id, message, mode):
 
             # -------------------------------------------------
             # MessageIdInvalid
-            # User requested this target to be removed too.
+            #
+            # The source message is unavailable/invalid.
+            # DO NOT remove the target.
+            # DO NOT notify the owner.
+            # Simply skip this message.
             # -------------------------------------------------
             if "MessageIdInvalid" in error_text:
-                return False, ("target_unavailable", error_text)
+                return False, ("message_invalid", "")
 
             # -------------------------------------------------
             # Target no longer available / access lost
@@ -115,7 +128,7 @@ async def _send_with_retry(bot, source_id, target_id, message, mode):
             # Other BadRequest
             return False, ("badrequest", error_text)
 
-        except Exception as e:
+        except Exception:
             logger.exception(
                 "Unexpected forward error sending to %s",
                 target_id,
@@ -225,8 +238,20 @@ async def channel_post_handler(
         reason, detail = err
 
         # =====================================================
+        # INVALID SOURCE MESSAGE
+        #
+        # Do absolutely nothing.
+        # Do not remove target.
+        # Do not notify owner.
+        # =====================================================
+        if reason == "message_invalid":
+            continue
+
+        # =====================================================
         # TARGET UNAVAILABLE
-        # Automatically remove target from DB
+        #
+        # Automatically remove unavailable target from DB.
+        # Owner notification is intentionally disabled.
         # =====================================================
         if reason == "target_unavailable":
 
@@ -236,46 +261,35 @@ async def channel_post_handler(
                     target_id,
                 )
 
-                note = (
-                    f"🗑️ TARGET REMOVED\n\n"
-                    f"Source: `{source_id}`\n"
-                    f"Target: `{target_id}`\n"
-                    f"Reason: `{detail}`"
+                logger.warning(
+                    "Target removed | Source=%s | Target=%s | Reason=%s",
+                    source_id,
+                    target_id,
+                    detail,
                 )
 
-            except Exception as e:
+            except Exception:
                 logger.exception(
                     "Failed to deactivate target %s",
                     target_id,
                 )
 
-                note = (
-                    f"⚠️ Target unavailable but DB removal failed\n\n"
-                    f"Source: `{source_id}`\n"
-                    f"Target: `{target_id}`\n"
-                    f"Error: `{e}`"
-                )
+            continue
 
-        else:
-            note = (
-                f"❌ Failed to forward message "
-                f"`{message.message_id}`\n\n"
-                f"Source: `{source_id}`\n"
-                f"Target: `{target_id}`\n"
-                f"Reason: `{reason}`\n"
-                f"Details: {detail}"
-            )
-
-        # Notify owners
-        for owner in OWNER_IDS:
-            try:
-                await bot.send_message(
-                    owner,
-                    note,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
+        # =====================================================
+        # OTHER FORWARD ERRORS
+        #
+        # Keep these only in Render logs.
+        # Nothing is sent to the owner.
+        # =====================================================
+        logger.warning(
+            "Forward failed | Message=%s | Source=%s | Target=%s | Reason=%s | Details=%s",
+            message.message_id,
+            source_id,
+            target_id,
+            reason,
+            detail,
+        )
 
     await db.bump_stats(
         forwarded=forwarded,
